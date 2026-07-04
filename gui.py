@@ -338,12 +338,23 @@ class ExportThread(QThread):
             self.log_signal.emit(traceback.format_exc())
             self.done_signal.emit(False, "", str(e))
 
+    @staticmethod
+    def _find_scripts_dir():
+        """找到 scripts 目录（优先同级，回退上级）"""
+        base = os.path.dirname(os.path.abspath(__file__))
+        # 优先：tgai_nlp/scripts/（repo clone 结构）
+        scripts = os.path.join(base, 'scripts')
+        if os.path.isdir(scripts):
+            return scripts
+        # 回退：../scripts/（用户原有结构）
+        return os.path.join(base, '..', 'scripts')
+
     def _do_export(self):
         import subprocess
         import sys
         import threading
 
-        scripts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
+        scripts_dir = self._find_scripts_dir()
 
         # 选择导出脚本
         model_type = self.model_type
@@ -481,7 +492,7 @@ class QuickPackThread(QThread):
         import subprocess
         import sys
 
-        scripts_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'scripts')
+        scripts_dir = ExportThread._find_scripts_dir()
         script_pack = os.path.join(scripts_dir, 'pack_tg.py')
         out_dir = os.path.dirname(os.path.abspath(self.onnx_path))
         out_tg = os.path.join(out_dir, f"{self.name}.tg")

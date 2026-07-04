@@ -359,6 +359,59 @@ python tgai_qq_bot.py --checkpoint checkpoints/milestone4000.pt
 
 ---
 
+## 📱 导出模型到手机（ONNX + TG CHAT）
+
+训完模型之后，可以导出为 ONNX 格式，扔到 TG CHAT APP 里离线推理。
+
+### GUI 导出（最简单）
+
+1. 打开 `gui.py`，切到「导出」标签页
+2. 选择一个 `.pt` checkpoint 文件
+3. 勾选「INT8 量化」（推荐，模型减半速度翻倍）
+4. 点击「导出并打包」→ 自动生成 `.TG` 文件
+5. 把 `.TG` 传到手机，在 TG CHAT 里一键导入
+
+### 命令行导出
+
+```bash
+# 步骤 1: 导出 ONNX 模型
+python scripts/export_onnx.py \
+    --checkpoint checkpoints/milestone4000.pt \
+    --out_dir exported/ \
+    --int8
+
+# 步骤 2: 打包为 .TG
+python scripts/pack_tg.py \
+    --model exported/tgai.onnx \
+    --tokenizer exported/tokenizer.json \
+    --out TGAI-4000.tg
+```
+
+### 导出 YUAZ（朋友模型）
+
+支持标准 Llama 架构的模型（YUAZ 等），在 GUI 里模型类型选「YUAZ (Llama)」即可。
+
+### 参数说明
+
+| 参数 | 说明 |
+|------|------|
+| `--int8` | 启用 INT8 动态量化，模型大小减半，推理加速约 2x |
+| `--opset` | ONNX opset 版本，默认 18 |
+| `--max_seq_len` | 示例序列长度（不影响运行时），默认 512 |
+
+### 相关脚本
+
+| 脚本 | 作用 |
+|------|------|
+| `scripts/export_onnx.py` | PyTorch checkpoint → ONNX 模型 |
+| `scripts/pack_tg.py` | ONNX + tokenizer → .TG 打包文件 |
+| `scripts/export_tokenizer_mobile.py` | 单独导出手机端 tokenizer |
+| `scripts/export_for_mobile.py` | 完整移动端导出（含自定义量化格式） |
+
+> ⚠️ 导出需要 8GB+ 内存。如果你的 checkpoint 包含优化器状态（训练存档），内存需求更大。建议用只含模型权重的 checkpoint 来导出。如果内存不够，找台内存大的电脑跑。
+
+---
+
 ## 🧠 模型架构
 
 ```
