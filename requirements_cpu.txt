@@ -1,0 +1,21 @@
+# TGAI 依赖 — CPU 版
+# pip install -r requirements_cpu.txt
+
+torch>=2.0.0
+tokenizers>=0.15.0
+
+# GUI
+PyQt6>=6.5.0
+
+# WebUI
+flask>=2.3.0
+flask-socketio>=5.3.0
+
+# QQ 机器人
+websocket-client>=1.6.0
+
+# 系统监控
+psutil>=5.9.0
+
+# 数据
+requests>=2.28.0

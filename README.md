@@ -1,0 +1,476 @@
+# TGAI-GUI-NLP —— 从训练到部署，一条龙全包
+
+<p align="center">
+  <strong>PyTorch 原生大语言模型训练框架 — 桌面 GUI · 云端 CLI · WebUI · QQ 机器人 · 一键导出手机端</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/python-3.9+-green" alt="python">
+  <img src="https://img.shields.io/badge/pytorch-2.0+-red" alt="pytorch">
+  <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
+  <img src="https://img.shields.io/badge/arch-MoE%20%2B%20SwiGLU%20%2B%20RoPE-purple" alt="arch">
+</p>
+
+---
+
+## 🤔 这 B 玩意儿是啥？
+
+**TGAI** 是一个 **从零手搓的大语言模型**，基于 PyTorch 原生实现，不依赖 HuggingFace Transformers。
+
+注意，不是那种 `from transformers import AutoModel` 一键调包的二道贩子——**这玩意儿连 Transformer Block 都是自己一行行写的**。
+
+你给它喂对话数据，它就学着回你话。训完的模型可以：
+- 在桌面 GUI 里聊（PyQt6）
+- 在手机浏览器上聊（Flask WebUI）
+- 挂到 QQ 上当赛博陪聊（NapCat 协议）
+- 导出 ONNX 塞进手机 APP 离线跑（TG CHAT）
+
+一句话：**数据进去，模型出来，部署一条龙。**
+
+---
+
+## ✨ 吹牛逼环节（但确实是真的）
+
+- 🖥️ **双界面训练** — 桌面 GUI 点点点就能训，命令行 `tgai-cli` 一行命令也能训。**不用写代码**。
+- ☁️ **云端一键训练** — 自带 YAML 配置文件，扔到 AutoDL / 矩池云上直接跑，**GPU 训练教程写进 README 了你还要怎样**。
+- 🧠 **MoE 混合专家架构** — 4 个专家、每次激活 2 个，SwiGLU 前馈、RoPE 旋转位置编码、Flash Attention、KV Cache 加速，该有的都有。
+- 🎛️ **GUI 参数面板** — 滑动条调参，实时 loss 曲线，训练过程中随时改超参数，不用重开。
+- 📱 **手机端部署** — 训完导出 ONNX 模型，扔到 TG CHAT APP 里就能离线推理。支持 INT8 量化加速。
+- 🌐 **WebUI 远程操控** — Flask + Socket.IO，手机/平板打开浏览器就能训练和聊天。
+- 🤖 **QQ 机器人** — 接 NapCat，自动回复群聊和私聊，还可以语音。
+- 📊 **数据工具链** — 训练数据统计分析、清洗去重、JSONL 合并，反正就是伺候你那个屎山数据集。
+- ⚡ **AMP 混合精度** — 自动混合精度训练，显卡不冒烟的同时快一截。
+- 💾 **智能缓存** — 数据集 mmap 缓存，几 GB 的 JSONL 也不用把内存撑爆。
+- 🔄 **断点续训** — 训练崩了？重开就接着跑，checkpoint 存得比你还勤快。
+
+---
+
+## 📦 快速开始（3 秒装不完，你忍忍）
+
+### 环境要求
+
+| 项 | 最低配置 | 推荐配置 |
+|----|----------|----------|
+| Python | 3.9+ | 3.11+ |
+| 内存 | 8 GB | 16+ GB |
+| 显卡（可选） | GTX 1060 6GB | RTX 3060 12GB+ |
+| 操作系统 | Windows / Linux | Ubuntu 22.04 |
+
+### 安装
+
+```bash
+git clone https://github.com/JXW666NB/TGAI-GUI-NLP.git
+cd TGAI-GUI-NLP
+
+# CPU 训练
+pip install -r requirements_cpu.txt
+
+# 或者 GPU 训练（CUDA 12.4）
+pip install -r requirements_gpu.txt
+```
+
+### 快速体验
+
+```bash
+# 启动桌面 GUI（Windows/Linux 都能跑）
+python gui.py
+
+# 或者启动 WebUI（手机也能用）
+python webui.py
+```
+
+> ⚠️ 如果你用 GPU 训练，`requirements_gpu.txt` 里的 PyTorch 是 CUDA 12.4 版。显卡不是这版本的话自己去 [pytorch.org](https://pytorch.org) 换。
+
+---
+
+## 🖥️ GUI 使用教程（桌面版，适合新手）
+
+启动 `gui.py` 后，你会看到一个 4 标签页的窗口。下面按使用顺序说。
+
+### 1️⃣ 训练（Training）标签页
+
+这是核心功能。界面分三块：
+
+**左侧：超参数配置**
+
+| 参数 | 说明 | 建议值 |
+|------|------|--------|
+| `d_model` | 模型隐藏层维度。越大越聪明，也越吃显存 | 256-896 |
+| `n_layers` | Transformer 层数 | 8-20 |
+| `n_heads` | 注意力头数 | 8-16 |
+| `d_ff` | 前馈网络维度 | d_model × 4 |
+| `n_experts` | MoE 专家数量 | 4 |
+| `n_activated` | 每次激活的专家数 | 2 |
+| `batch_size` | 每步训练的样本数 | 8-32 |
+| `learning_rate` | 学习率 | 1e-4 |
+| `epochs` | 训练轮数 | 10-50 |
+| `grad_accum` | 梯度累积步数（等效批大小 = batch_size × grad_accum） | 4-8 |
+| `dropout` | 丢弃率，防过拟合 | 0.1 |
+| `warmup_steps` | 学习率预热步数 | 500-2000 |
+| `seq_len` | 序列最大长度 | 256-512 |
+
+**中间：训练控制**
+
+- 点击「训练数据」旁边的「浏览」选择你的 `.jsonl` 文件
+- 点击「输出目录」选择 checkpoint 存放位置
+- 点击「🚀 开始训练」就开跑了
+
+**右侧：实时监控**
+
+- 训练过程中 loss 曲线实时更新
+- 控制台日志输出每个 step 的 loss、学习率、perplexity
+
+**训练数据格式（.jsonl）：**
+
+```jsonl
+{"text": "用户：你好\nTGAI：你好！有什么可以帮你的？"}
+{"text": "用户：今天天气怎么样\nTGAI：抱歉我是AI，不知道实时天气哦。不过你可以看看窗外！"}
+```
+
+一行一个对话，`\n` 分隔用户和助手。
+
+### 2️⃣ 聊天（Chat）标签页
+
+训练完后，加载模型开始唠嗑。
+
+1. 点击「加载模型」选择一个 `.pt` checkpoint 文件
+2. 在输入框打字，回车发送
+3. 右侧可调节温度、top-k、top-p、重复惩罚等生成参数
+
+| 参数 | 说明 | 范围 |
+|------|------|------|
+| 温度 | 越高越浪，越低越保守 | 0.1-2.0 |
+| Top-K | 每步只从 K 个最高概率词里抽 | 1-100 |
+| Top-P | 核采样，累积概率截断 | 0-1.0 |
+| 重复惩罚 | 大于 1.0 惩罚复读机行为 | 1.0-2.0 |
+
+### 3️⃣ 分词器（Tokenizer）标签页
+
+- 输入任意文本，看 tokenize 结果
+- 浏览完整词表
+
+### 4️⃣ 数据（Data）标签页
+
+- 查看/编辑训练数据
+- 统计问答长度、检查格式问题
+
+---
+
+## ☁️ CLI 云端服务器训练教程
+
+如果你有一台云 GPU（AutoDL、矩池云、恒源云等），用命令行训练更方便。
+
+### 第一步：连上服务器
+
+```bash
+ssh -p 端口号 root@你的服务器IP
+```
+
+### 第二步：装环境
+
+```bash
+# 克隆项目
+git clone https://github.com/JXW666NB/TGAI-GUI-NLP.git
+cd TGAI-GUI-NLP
+
+# 装依赖（GPU 版依赖自带 CUDA 12.4 的 PyTorch）
+pip install -r requirements_gpu.txt
+
+# 如果你的 CUDA 版本不是 12.4，手动装 PyTorch
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+```
+
+### 第三步：准备数据
+
+把你的 `.jsonl` 训练数据上传到服务器：
+
+```bash
+# 本地执行
+scp your_data.jsonl root@服务器IP:/root/TGAI-GUI-NLP/data/
+
+# 检查数据质量
+python tgai_cli.py data stats --input data/your_data.jsonl
+```
+
+输出示例：
+```
+总样本数: 5230
+最短 Q: 2 字 | 最长 Q: 87 字 | 平均: 15.3 字
+最短 A: 5 字 | 最长 A: 243 字 | 平均: 48.7 字
+[警告] 3 条样本答案长度 < 10 字，可能质量较低
+```
+
+### 第四步：生成训练配置文件
+
+```bash
+python tgai_cli.py config generate
+```
+
+这会生成一个 `train_config.yaml`，打开改改：
+
+```yaml
+# train_config.yaml
+data_path: data/your_data.jsonl
+output_dir: checkpoints/
+
+# 模型参数
+vocab_size: 16384
+d_model: 512
+n_layers: 12
+n_heads: 8
+d_ff: 2048
+max_seq_len: 256
+
+# MoE
+n_experts: 4
+n_activated: 2
+
+# 训练参数
+batch_size: 16
+epochs: 30
+learning_rate: 0.0001
+grad_accum: 4
+warmup_steps: 2000
+dropout: 0.1
+```
+
+### 第五步：开训！
+
+```bash
+# 使用 YAML 配置文件训练
+python tgai_cli.py train --config train_config.yaml
+
+# 或者不用配置文件，直接命令行传参
+python tgai_cli.py train \
+    --data data/your_data.jsonl \
+    --epochs 30 \
+    --batch 16 \
+    --d_model 512 \
+    --n_layers 12 \
+    --grad_accum 4
+```
+
+### 第六步：后台运行（防止 SSH 断开导致训练中断）
+
+```bash
+# 用 nohup 后台跑
+nohup python tgai_cli.py train --config train_config.yaml > train.log 2>&1 &
+
+# 查看进度
+tail -f train.log
+
+# 查看训练状态
+python tgai_cli.py status
+```
+
+输出示例：
+```
+系统状态:
+  CPU: Intel Xeon 8核 | 使用率: 34%
+  内存: 32.0 GB | 已用: 18.2 GB (56.9%)
+  GPU: NVIDIA RTX 4090 | 显存: 24.0 GB | 已用: 14.8 GB
+  Python: 3.11.9
+
+Checkpoints:
+  milestone1000.pt     ( 839 MB)  2025-07-03 14:22
+  milestone2000.pt     ( 839 MB)  2025-07-03 15:18
+  last_step.pt         ( 839 MB)  2025-07-03 15:33
+
+训练进程:
+  PID 12345  运行中  |  日志: train.log (2.3 MB)
+```
+
+### 第七步：下载训练好的模型
+
+```bash
+# 查看有哪些 checkpoint
+ls -lh checkpoints/
+
+# 在本地电脑执行
+scp root@服务器IP:/root/TGAI-GUI-NLP/checkpoints/milestone*.pt ./
+```
+
+### 常用 CLI 命令速查
+
+```bash
+# 查看帮助
+python tgai_cli.py --help
+
+# 训练
+python tgai_cli.py train --config train_config.yaml
+
+# 聊天
+python tgai_cli.py chat --checkpoint checkpoints/milestone4000.pt
+
+# 数据统计
+python tgai_cli.py data stats --input data/train.jsonl
+
+# 数据清洗
+python tgai_cli.py data clean --input data/train.jsonl --output data/cleaned.jsonl
+
+# 合并多个数据文件
+python tgai_cli.py data merge --input data/a.jsonl data/b.jsonl --output data/merged.jsonl
+
+# 生成默认配置
+python tgai_cli.py config generate
+
+# 系统状态
+python tgai_cli.py status
+```
+
+---
+
+## 🌐 WebUI 远程操控
+
+如果你不想装 PyQt6（比如云服务器没桌面），可以用 WebUI：
+
+```bash
+python webui.py
+```
+
+默认监听 `0.0.0.0:5000`，手机/平板打开浏览器访问 `http://服务器IP:5000` 就能操作。功能跟桌面 GUI 差不多，暗色主题，移动端自适应。
+
+---
+
+## 🤖 QQ 机器人部署
+
+### 准备工作
+
+1. 装 [NapCat](https://github.com/NapNeko/NapCatQQ)（QQ 机器人框架）
+2. 把 `qq_bot_config.json` 里的 WebSocket URL 和 token 填对：
+
+```json
+{
+    "ws_url": "ws://127.0.0.1:6099/api/Debug/ws?token=你的token",
+    "http_url": "http://127.0.0.1:6099",
+    "bot_qq": "你的机器人QQ号",
+    "temperature": 0.8
+}
+```
+
+### 启动
+
+```bash
+python tgai_qq_bot.py --checkpoint checkpoints/milestone4000.pt
+```
+
+群聊里 @机器人 或以 "TGAI" 开头就会回复。私聊自动回复。
+
+---
+
+## 🧠 模型架构
+
+```
+TGAILanguageModel (V4 Decoder-Only MoE Transformer)
+
+Embedding
+  ↓
+[TransformerBlock × n_layers]
+  ├── RMSNorm
+  ├── FlashSelfAttention (RoPE + KV Cache)
+  ├── RMSNorm
+  └── MoELayer
+      ├── Router (Top-K Gating)
+      └── Experts × n_experts (SwiGLUFFN)
+  ↓
+RMSNorm
+  ↓
+LM Head (weight tied with embedding)
+```
+
+| 组件 | 技术 |
+|------|------|
+| 位置编码 | RoPE（旋转位置编码） |
+| 归一化 | RMSNorm（Root Mean Square） |
+| 注意力 | Flash Attention（`scaled_dot_product_attention`） |
+| 前馈网络 | SwiGLU（SwiGLUFFN） |
+| 混合专家 | MoE（Top-K 路由 + 负载均衡 loss） |
+| KV 缓存 | 预分配缓冲区，动态扩展 |
+| 推理加速 | `torch.compile` + KV Cache 流式输出 |
+
+---
+
+## 🏗️ 项目结构
+
+```
+tgai_nlp/
+├── gui.py                  # 🖥️ PyQt6 桌面 GUI（训练/聊天/分词器/数据编辑器）
+├── webui.py                # 🌐 Flask + Socket.IO WebUI（手机也能用）
+├── tgai_cli.py             # ☁️ 命令行工具（云端训练/数据管理/配置生成）
+├── train.py                # 🔥 训练引擎（AMP 混合精度、梯度累积、断点续训）
+├── model.py                # 🧠 V4 MoE Transformer 模型定义
+├── tokenizer.py            # 🔤 BPE 分词器（中文优化 CJK 预分词）
+├── inference.py            # 💬 推理引擎（流式输出/KV Cache/采样策略）
+├── tgai_qq_bot.py          # 🤖 QQ 机器人（NapCat 协议）
+├── data/
+│   ├── custom_train.jsonl  # 示例训练数据（30+ 条 QA）
+│   └── train_all.jsonl     # 完整训练数据
+├── requirements.txt        # 基础依赖
+├── requirements_cpu.txt    # CPU 训练依赖
+├── requirements_gpu.txt    # GPU 训练依赖（CUDA 12.4）
+├── .gitignore
+├── LICENSE
+└── README.md               # 你他妈正在看的这玩意儿
+```
+
+---
+
+## 🔧 参数估算
+
+训练前不确定该用什么参数？以下是经验公式：
+
+### 显存估算（FP16 训练）
+
+```
+显存 ≈ (参数量 × 2 字节) + (激活值 × 2 字节) × 2
+
+参数量 ≈ vocab_size × d_model + n_layers × (4 × d_model² + 3 × d_model × d_ff × n_experts)
+```
+
+| 配置 | 参数量 | 显存占用 | 推荐 GPU |
+|------|--------|----------|----------|
+| `d_model=256, n_layers=8` | ~50M | ~2 GB | GTX 1060 |
+| `d_model=384, n_layers=10` | ~120M | ~4 GB | RTX 2060 |
+| `d_model=512, n_layers=12` | ~250M | ~8 GB | RTX 3060 |
+| `d_model=768, n_layers=16` | ~600M | ~16 GB | RTX 3090 |
+| `d_model=896, n_layers=20` | ~1000M | ~24 GB | RTX 4090 |
+
+> ⚠️ 这是估计值，实际会因 `seq_len`、`batch_size`、`grad_accum` 而变化。拿不准？`tgai_cli.py train` 启动时会自动估算并提醒你。
+
+---
+
+## 🎮 快捷操作
+
+| 操作 | GUI | CLI |
+|------|-----|-----|
+| 开始训练 | 点击「🚀 开始训练」 | `tgai_cli.py train --config xxx.yaml` |
+| 断点续训 | 同上，自动检测 `last_step.pt` | `tgai_cli.py train --resume` |
+| 加载模型聊天 | Chat 标签页 → 加载模型 | `tgai_cli.py chat --checkpoint xxx.pt` |
+| 数据统计 | Data 标签页 | `tgai_cli.py data stats` |
+| 后台训练 | 不支持 | `nohup tgai_cli.py train ... &` |
+
+---
+
+## 🤝 贡献与反馈
+
+觉得这项目烂得清奇，或者想把你的屎山合并进来？欢迎提 Issue、PR，或者进 QQ 群 **1082708943** 开喷。如果你被这项目逗笑了，请点个 Star ⭐️，作者会感动到多吃一碗泡面。
+
+---
+
+## 📄 许可证
+
+本项目采用 [MIT 许可证](LICENSE)。随便改、随便卖、随便塞进毕设里——**但得把原作者名字留着**，否则半夜会有 AI 爬你窗户。
+
+---
+
+## 🔗 相关项目
+
+- 📱 **TG CHAT**（手机 APP）：[github.com/JXW666NB/TGAI_CHAT](https://github.com/JXW666NB/TGAI_CHAT)
+- 🛠️ **TG-HELPER**（桌面 AI 助手）：[github.com/JXW666NB/TG-HELPER](https://github.com/JXW666NB/TG-HELPER)
+- 🎮 **TGAI 模型导出**（ONNX / 手机端）：本项目的 `scripts/` 子目录
+
+---
+
+**踏马的终于肝完力**
+—— JXW, 2025 年某个通宵的凌晨

@@ -1,0 +1,34 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 模型权重太大，不上传 git（用户自己训练或用 HuggingFace 下载）
+checkpoints/
+*.pt
+*.pth
+
+# 个人数据
+qq_memory/
+qq_bot_config.json
+
+# 备份文件
+*.backup*
+*.bak
+
+# 临时文件
+*.log
+crash_log.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Python
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+env/
