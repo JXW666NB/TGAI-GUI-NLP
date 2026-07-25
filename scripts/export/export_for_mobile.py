@@ -21,7 +21,7 @@ from typing import Dict, List, Tuple
 import torch
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tgai_nlp'))
 from model import TGAILanguageModel, TGAIConfig, create_model
 
 

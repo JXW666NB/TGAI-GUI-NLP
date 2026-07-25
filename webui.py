@@ -562,6 +562,11 @@ def on_send_message(data):
 
     temperature = data.get('temperature', 0.8)
     max_tokens = data.get('max_tokens', 128)
+    top_k = data.get('top_k', 50)
+    top_p = data.get('top_p', 0.95)
+    frequency_penalty = data.get('frequency_penalty', 0.25)
+    repetition_penalty = data.get('repetition_penalty', 1.05)
+    min_new_tokens = data.get('min_new_tokens', 5)
     show_debug = data.get('debug', False)
 
     try:
@@ -571,7 +576,9 @@ def on_send_message(data):
 
         for chunk in generator.generate(
             prompt, max_new_tokens=max_tokens, temperature=temperature,
-            top_k=50, top_p=0.95, frequency_penalty=0.25, stream=True,
+            top_k=top_k, top_p=top_p, frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
+            min_new_tokens=min_new_tokens, stream=True,
         ):
             response += chunk
             emit('chat_chunk', {'token': chunk})
@@ -746,8 +753,18 @@ body{font-family:"Microsoft YaHei","PingFang SC",sans-serif;background:#1a1a2e;c
   <div class="chat-controls">
     <button class="btn btn-gray btn-sm" id="btn-load-model" onclick="showModelList()">📂 加载模型</button>
     <span id="chat-model-info" style="font-size:11px;color:#888"></span>
-    <label style="margin-left:auto">温度 <span id="temp-val">0.8</span></label>
-    <input type="range" id="chat-temp" min="0.1" max="2" step="0.1" value="0.8" oninput="document.getElementById('temp-val').textContent=this.value">
+    <details style="margin-left:auto">
+      <summary style="cursor:pointer;color:#888;font-size:12px">⚙ 参数</summary>
+      <div class="config-grid" style="margin-top:6px;gap:4px">
+        <div class="config-item">温度 <input id="chat-temp" type="number" min="0.1" max="2" step="0.1" value="0.9" style="width:55px"></div>
+        <div class="config-item">Max Token <input id="chat-max-tokens" type="number" min="16" max="1024" step="16" value="128" style="width:55px"></div>
+        <div class="config-item">Top-K <input id="chat-topk" type="number" min="1" max="200" step="1" value="50" style="width:55px"></div>
+        <div class="config-item">Top-P <input id="chat-topp" type="number" min="0" max="1" step="0.05" value="0.95" style="width:55px"></div>
+        <div class="config-item">频率惩罚 <input id="chat-freq-pen" type="number" min="0" max="1" step="0.05" value="0.25" style="width:55px"></div>
+        <div class="config-item">重复惩罚 <input id="chat-rep-pen" type="number" min="0.1" max="3" step="0.05" value="1.05" style="width:55px"></div>
+        <div class="config-item">最小长度 <input id="chat-min-tokens" type="number" min="0" max="50" step="1" value="5" style="width:55px"></div>
+      </div>
+    </details>
     <label><input type="checkbox" id="chat-debug"> 调试</label>
   </div>
   <div class="chat-area">
@@ -915,8 +932,16 @@ function sendMessage() {
 
   const debug = document.getElementById('chat-debug').checked;
   const temp = parseFloat(document.getElementById('chat-temp').value);
+  const maxTokens = parseInt(document.getElementById('chat-max-tokens').value) || 128;
+  const topk = parseInt(document.getElementById('chat-topk').value) || 50;
+  const topp = parseFloat(document.getElementById('chat-topp').value) || 0.95;
+  const freqPen = parseFloat(document.getElementById('chat-freq-pen').value) || 0.25;
+  const repPen = parseFloat(document.getElementById('chat-rep-pen').value) || 1.05;
+  const minTokens = parseInt(document.getElementById('chat-min-tokens').value) || 5;
 
-  socket.emit('send_message', {text, temperature: temp, max_tokens: 128, debug});
+  socket.emit('send_message', {text, temperature: temp, max_tokens: maxTokens,
+    top_k: topk, top_p: topp, frequency_penalty: freqPen, repetition_penalty: repPen,
+    min_new_tokens: minTokens, debug});
 
   // 移除旧监听器
   socket.off('chat_chunk');

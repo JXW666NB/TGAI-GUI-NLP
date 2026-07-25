@@ -39,6 +39,8 @@ def load_model(
     tokenizer_path: str,
     device: str = "cpu",
     compile_model: bool = False,
+    self_extend: bool = False,
+    extend_max_seq_len: int = 4096,
 ) -> Tuple[TGAILanguageModel, ChineseTokenizer]:
     """加载训练好的模型和分词器"""
     if not os.path.exists(checkpoint_path):
@@ -52,6 +54,8 @@ def load_model(
 
     print(f"模型: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    ckpt_step = ckpt.get('step', ckpt.get('global_step', '?'))
+    print(f"  训练步数: {ckpt_step}")
     mc = ckpt.get('model_config', {})
     state_dict = ckpt['model_state_dict']
 
@@ -75,6 +79,8 @@ def load_model(
         dropout=0.0,  # 推理时关闭 dropout
         n_experts=n_experts,
         n_activated=n_activated,
+        self_extend=self_extend,
+        extend_max_seq_len=extend_max_seq_len,
     )
     # 向后兼容: 迁移旧格式 RoPE cos/sin
     for key in list(state_dict.keys()):
@@ -131,21 +137,31 @@ class TextGenerator:
         top_p: float = 0.95,
         frequency_penalty: float = 0.25,
         repetition_penalty: float = 1.05,
+        min_new_tokens: int = 5,
         stream: bool = False,
+        formatted: bool = False,
+        token_bias: dict = None,
+        prefix_bias: dict = None,
+        force_prefix: str = None,
     ) -> str | Generator[str, None, None]:
         """
         生成文本。stream=True 返回逐 token 生成器。
         repetition_penalty: 1.0=关闭, 1.05=轻度, 1.2=较强
+        min_new_tokens: 生成至少N个token后才允许EOS (防止过早结束)
+        formatted: True=prompt已经是完整格式(如 "用户:...\\nTGAI?"), False=自动包装
         """
         # 构造 prompt — 与训练数据格式保持一致
-        formatted = f"用户:{prompt}\nTGAI?"
-        prompt_ids = [BOS_ID] + self.tokenizer.encode(formatted, add_special=False)
+        if formatted:
+            prompt_text = prompt  # 已经是完整格式，不重新包装
+        else:
+            prompt_text = f"用户:{prompt}\nTGAI?"
+        prompt_ids = [BOS_ID] + self.tokenizer.encode(prompt_text, add_special=False)
         prompt_ids = [min(tid, self.model.config.vocab_size - 1) for tid in prompt_ids]
 
         if stream:
-            return self._generate_stream(prompt_ids, max_new_tokens, temperature, top_k, top_p, frequency_penalty, repetition_penalty)
+            return self._generate_stream(prompt_ids, max_new_tokens, temperature, top_k, top_p, frequency_penalty, repetition_penalty, min_new_tokens, token_bias, prefix_bias, force_prefix)
         else:
-            return self._generate_full(prompt_ids, max_new_tokens, temperature, top_k, top_p, frequency_penalty, repetition_penalty)
+            return self._generate_full(prompt_ids, max_new_tokens, temperature, top_k, top_p, frequency_penalty, repetition_penalty, min_new_tokens, token_bias, prefix_bias, force_prefix)
 
     def _generate_full(
         self,
@@ -156,20 +172,20 @@ class TextGenerator:
         top_p: float,
         frequency_penalty: float,
         repetition_penalty: float = 1.0,
+        min_new_tokens: int = 5,
+        token_bias: dict = None,
+        prefix_bias: dict = None,
+        force_prefix: str = None,
     ) -> str:
-        """非流式: 一次性返回完整回复"""
-        prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-        output_ids = self.model.generate(
-            prompt_tensor,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            top_p=top_p,
-            eos_token_id=EOS_ID,
-            frequency_penalty=frequency_penalty,
-            repetition_penalty=repetition_penalty,
-        )
-        return self._decode_response(prompt_ids, output_ids[0].tolist())
+        """非流式: 一次性返回完整回复（复用流式生成器）"""
+        reply = ""
+        for token in self._generate_stream(
+            prompt_ids, max_new_tokens, temperature, top_k, top_p,
+            frequency_penalty, repetition_penalty, min_new_tokens,
+            token_bias, prefix_bias, force_prefix,
+        ):
+            reply += token
+        return reply
 
     def _generate_stream(
         self,
@@ -180,31 +196,70 @@ class TextGenerator:
         top_p: float,
         frequency_penalty: float,
         repetition_penalty: float = 1.05,
+        min_new_tokens: int = 5,
+        token_bias: dict = None,
+        prefix_bias: dict = None,
+        force_prefix: str = None,
     ) -> Generator[str, None, None]:
         """流式: 逐个 token yield，使用 KV Cache 加速"""
         model = self.model
         model.eval()
         inv_temp = 1.0 / max(temperature, 0.01)
         vocab_size = model.config.vocab_size
-        min_new = 5  # 前5个token禁止EOS
+        min_new = min_new_tokens  # 允许调用方设置
+
+        # Encode force_prefix (兜底起手式)
+        force_ids = None
+        force_pos = 0
+        if force_prefix:
+            force_ids = self.tokenizer.encode(force_prefix, add_special=False)
+            force_ids = [min(tid, vocab_size - 1) for tid in force_ids]
 
         prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
+        effective_max = model.config.extend_max_seq_len if model.config.self_extend else model.config.max_seq_len
+
+        # 如果 max_new_tokens 超过上下文窗口，自动缩减并警告
+        if max_new_tokens >= effective_max:
+            old_max = max_new_tokens
+            max_new_tokens = max(effective_max - 16, 16)
+            print(f"\n  [警告] max_tokens={old_max} 超出上下文窗口 {effective_max}，自动缩减为 {max_new_tokens}", flush=True)
+
+        # 如果 prompt 超过模型上下文窗口，截断前半部分（保留 BOS + 最近上下文）
+        prompt_len = len(prompt_ids)
+        max_prompt = max(effective_max - max_new_tokens, 1)  # 至少保留 BOS
+        if prompt_len > max_prompt:
+            # 跳过 BOS 位置，从头截断
+            prompt_ids = [prompt_ids[0]] + prompt_ids[prompt_len - max_prompt + 1:]
+            prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
 
         # Prefill
         kv_caches = [{} for _ in range(model.config.n_layers)]
         logits, kv_caches = model(prompt_tensor, kv_caches)
         next_logits = logits[:, -1, :] * inv_temp
 
+        # 保存 prefill 阶段的专家使用情况 (用于诊断，不被后续 token 覆盖)
+        model._prefill_expert_usage = {}
+        for i, block in enumerate(model.blocks):
+            usage = block.moe.expert_usage
+            if usage is not None:
+                model._prefill_expert_usage[i] = usage.detach().clone()
+
         generated_ids = list(prompt_ids)
         token_counts = torch.zeros(vocab_size, dtype=torch.long, device=self.device)
         new_tokens = 0
         t0 = time.time()
+        _reply_so_far = ""
+        _last_token_id = -1      # 连续重复检测
+        _consecutive_same = 0
+        _recent_tids = []        # 最近 12 个 token_id 用于模式检测
+        _total_loops = 0          # 总循环次数 (调试用)
 
         for _ in range(max_new_tokens):
+            _total_loops += 1
             step_start = time.time()
             # 超长截断
-            if len(generated_ids) > model.config.max_seq_len:
-                generated_ids = generated_ids[-model.config.max_seq_len // 2:]
+            if len(generated_ids) >= effective_max:
+                generated_ids = generated_ids[-effective_max // 2:]
                 kv_caches = [{} for _ in range(model.config.n_layers)]
                 token_counts.zero_()
                 for t in generated_ids:
@@ -233,8 +288,14 @@ class TextGenerator:
             # 采样前记录 top-3 候选 (基于 raw logits 的 softmax)
             raw_logits_snapshot = next_logits.clone()
 
+            # 连续重复 token 惩罚（递增打压，防止 "是是是"/"TIATIA" 死循环）
+            if _consecutive_same >= 3:
+                next_logits[0, _last_token_id] -= _consecutive_same * 3.0
+            if _consecutive_same > 12 and new_tokens >= min_new:
+                break  # 极端重复直接截断 (但不违反最小输出)
+
             # 退化预防: top-1 概率 > 95% 时打压 (用 logit 差值判断，避免一次 softmax)
-            sorted_for_check = torch.sort(next_logits, descending=True)[0]
+            sorted_for_check = torch.sort(next_logits.detach(), descending=True)[0]
             top1_gap = float(sorted_for_check[0, 0] - sorted_for_check[0, min(1, sorted_for_check.shape[-1]-1)])
             # 用温度校正: 高温下 logit 差距自然小，放宽阈值
             gap_threshold = 0.2 / max(temperature, 0.1)
@@ -242,14 +303,59 @@ class TextGenerator:
                 top1_id = int(next_logits.argmax(dim=-1)[0])
                 next_logits[0, top1_id] -= 1.5  # 适当打压
 
-            # Top-K + Top-P 采样
-            next_logits = self._sample(next_logits.clone(), top_k, top_p)
-            probs = F.softmax(next_logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1).item()
-            next_token = min(next_token, vocab_size - 1)
+            # 兜底起手式：当模型空回复时，跳过采样，直接注入 force_prefix token
+            if force_ids is not None and force_pos < len(force_ids):
+                next_token = force_ids[force_pos]
+                force_pos += 1
+                probs = F.softmax(next_logits, dim=-1)  # 用于调试信息
+            else:
+                # Top-K + Top-P 采样
+                next_logits = self._sample(next_logits.clone(), top_k, top_p)
+                # _sample fallback 可能恢复 EOS → 重新禁止
+                if new_tokens < min_new and EOS_ID < vocab_size:
+                    next_logits[:, EOS_ID] = float('-inf')
+                # token bias: 惩罚特定 token 但不禁用
+                if token_bias:
+                    for tid, bias in token_bias.items():
+                        next_logits[0, tid] += bias
+                # prefix-triggered bias: 特定前缀出现时临时调整 token 概率
+                # 空字符串 "" 作为前缀 = 仅第一个 token 生效（用于拦截跑偏开头）
+                if prefix_bias:
+                    for prefix, biases in prefix_bias.items():
+                        if prefix.startswith("_"):
+                            continue
+                        match = False
+                        if prefix == "" and not _reply_so_far:
+                            match = True  # 第一个 token
+                        elif _reply_so_far and _reply_so_far.rstrip().endswith(prefix):
+                            match = True
+                        if match:
+                            for word, bias_val in biases.items():
+                                if word.startswith("_") or not isinstance(bias_val, (int, float)):
+                                    continue
+                                for tid in self.tokenizer.encode(word, add_special=False):
+                                    next_logits[0, tid] += bias_val
+                probs = F.softmax(next_logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).item()
+                next_token = min(next_token, vocab_size - 1)
+
+                # "用" 族重试 — 第一token多试几次，后续位置轻量重试
+                _tries = 0
+                _max_tries = 20 if not _reply_so_far else 3
+                while (_tries < _max_tries
+                       and self.tokenizer.decode([next_token], skip_special=True).strip() in ("用", "用户", "户")):
+                    next_logits[0, next_token] = float('-inf')
+                    if torch.all(torch.isinf(next_logits[0])):
+                        break  # 全 ban 了，放弃重试
+                    probs = F.softmax(next_logits, dim=-1)
+                    if torch.isnan(probs).any() or torch.any(probs < 0):
+                        break  # NaN，放弃重试
+                    next_token = torch.multinomial(probs, num_samples=1).item()
+                    next_token = min(next_token, vocab_size - 1)
+                    _tries += 1
 
             # ── 收集调试信息 (基于最终 probs) ──
-            token_prob = float(probs[0, next_token])
+            token_prob = float(probs[0, next_token].detach())
             # top-5 候选
             top_n = min(5, vocab_size)
             top_vals, top_ids = torch.topk(probs, top_n)
@@ -289,18 +395,47 @@ class TextGenerator:
             if 0 <= next_token < vocab_size:
                 token_counts[next_token] += 1
 
-            # 退化检测: 连续8个相同token → 强制结束
-            if new_tokens >= 8:
-                last8 = generated_ids[-8:]
-                if len(set(last8)) == 1:
+            # ── 连续重复 & 模式检测 ──
+            if next_token == _last_token_id:
+                _consecutive_same += 1
+            else:
+                _consecutive_same = 1
+            _last_token_id = next_token
+            _recent_tids.append(next_token)
+            if len(_recent_tids) > 12:
+                _recent_tids = _recent_tids[-12:]
+
+            # 2-token 循环: [a,b,a,b,a,b]
+            if len(_recent_tids) >= 6 and new_tokens >= min_new:
+                if _recent_tids[-2:] == _recent_tids[-4:-2] == _recent_tids[-6:-4]:
+                    break
+            # 3-token 循环: [a,b,c,a,b,c]
+            if len(_recent_tids) >= 9 and new_tokens >= min_new:
+                if _recent_tids[-3:] == _recent_tids[-6:-3] == _recent_tids[-9:-6]:
+                    break
+            # 非中文洪水: 末尾 30 字符中 >60% 是 ASCII 字母 → 英文乱码
+            if new_tokens >= min_new and new_tokens >= 15 and len(_reply_so_far) >= 30:
+                tail = _reply_so_far[-30:]
+                ascii_alpha = sum(1 for c in tail if c.isascii() and c.isalpha())
+                if ascii_alpha > 18:
                     break
 
-            if next_token == EOS_ID:
+            if next_token == EOS_ID and new_tokens >= min_new:
                 break
 
             # 流式输出
             new_text = self.tokenizer.decode([next_token], skip_special=True)
             if new_text:
+                _reply_so_far += new_text
+                # 自问自答检测: 先检查再输出
+                if any(m in _reply_so_far for m in ["\n用户", "\n用", "\n户",
+                                                        "用户:", "用户：", "用户\n", "用户。",
+                                                        "\nTGAI?", "\nTGAI", "\nTG?", "\nTGA?",
+                                                        "TGAI?", "TGA?",
+                                                        "\nTGA", "\nTGA\n", "TGA\n",
+                                                        "\nTG", "\nTGA。",
+                                                        "\n用"]):
+                    break
                 yield new_text
 
             # Decode step
@@ -381,6 +516,11 @@ def interactive_chat(
     tokenizer: ChineseTokenizer,
     temperature: float = 0.8,
     max_new_tokens: int = 128,
+    top_k: int = 50,
+    top_p: float = 0.95,
+    frequency_penalty: float = 0.25,
+    repetition_penalty: float = 1.05,
+    min_new_tokens: int = 5,
     stream: bool = True,
 ):
     """交互式对话循环"""
@@ -392,7 +532,12 @@ def interactive_chat(
     generator = TextGenerator(model, tokenizer)
     history: List[str] = []
     current_temp = temperature
-    current_freq_penalty = 0.3
+    current_max = max_new_tokens
+    current_topk = top_k
+    current_topp = top_p
+    current_freq_pen = frequency_penalty
+    current_rep_pen = repetition_penalty
+    current_min_tokens = min_new_tokens
 
     while True:
         try:
@@ -410,11 +555,16 @@ def interactive_chat(
                 print("再见!")
                 break
             elif cmd == '/help':
-                print("命令: /exit /temp N /freq N /stream /clear /help")
-                print("  /temp N   - 设置温度 (0.1~2.0)")
-                print("  /freq N   - 设置频率惩罚 (0.0~1.0)")
-                print("  /stream   - 切换流式输出")
-                print("  /clear    - 清除对话历史")
+                print("命令: /exit /temp N /maxtokens N /topk N /topp N /freq N /rep N /stream /clear /help")
+                print("  /temp N      - 设置温度 (0.1~2.0)")
+                print("  /maxtokens N - 设置最大 token 数 (16~1024)")
+                print("  /topk N      - 设置 Top-K (1~200)")
+                print("  /topp N      - 设置 Top-P (0.0~1.0)")
+                print("  /freq N      - 设置频率惩罚 (0.0~1.0)")
+                print("  /rep N       - 设置重复惩罚 (0.1~3.0)")
+                print("  /mintokens N - 设置最小生成token数 (0~50)")
+                print("  /stream      - 切换流式输出")
+                print("  /clear       - 清除对话历史")
             elif cmd == '/clear':
                 history = []
                 print("[对话历史已清除]")
@@ -427,12 +577,42 @@ def interactive_chat(
                     print(f"[温度: {current_temp}]")
                 except (ValueError, IndexError):
                     print(f"[当前温度: {current_temp}]")
+            elif cmd.startswith('/maxtokens'):
+                try:
+                    current_max = max(16, min(1024, int(user_input.split()[-1])))
+                    print(f"[Max Tokens: {current_max}]")
+                except (ValueError, IndexError):
+                    print(f"[当前 Max Tokens: {current_max}]")
+            elif cmd.startswith('/topk'):
+                try:
+                    current_topk = max(1, min(200, int(user_input.split()[-1])))
+                    print(f"[Top-K: {current_topk}]")
+                except (ValueError, IndexError):
+                    print(f"[当前 Top-K: {current_topk}]")
+            elif cmd.startswith('/topp'):
+                try:
+                    current_topp = max(0.0, min(1.0, float(user_input.split()[-1])))
+                    print(f"[Top-P: {current_topp}]")
+                except (ValueError, IndexError):
+                    print(f"[当前 Top-P: {current_topp}]")
             elif cmd.startswith('/freq'):
                 try:
-                    current_freq_penalty = max(0.0, min(1.0, float(user_input.split()[-1])))
-                    print(f"[频率惩罚: {current_freq_penalty}]")
+                    current_freq_pen = max(0.0, min(1.0, float(user_input.split()[-1])))
+                    print(f"[频率惩罚: {current_freq_pen}]")
                 except (ValueError, IndexError):
-                    print(f"[当前频率惩罚: {current_freq_penalty}]")
+                    print(f"[当前频率惩罚: {current_freq_pen}]")
+            elif cmd.startswith('/rep'):
+                try:
+                    current_rep_pen = max(0.1, min(3.0, float(user_input.split()[-1])))
+                    print(f"[重复惩罚: {current_rep_pen}]")
+                except (ValueError, IndexError):
+                    print(f"[当前重复惩罚: {current_rep_pen}]")
+            elif cmd.startswith('/mintokens'):
+                try:
+                    current_min_tokens = max(0, min(50, int(user_input.split()[-1])))
+                    print(f"[最小Token数: {current_min_tokens}]")
+                except (ValueError, IndexError):
+                    print(f"[当前最小Token数: {current_min_tokens}]")
             continue
 
         try:
@@ -441,16 +621,23 @@ def interactive_chat(
                 print("TGAI: ", end="", flush=True)
                 response = ""
                 for chunk in generator.generate(
-                    user_input, max_new_tokens, current_temp,
-                    frequency_penalty=current_freq_penalty, stream=True,
+                    user_input, current_max, current_temp,
+                    top_k=current_topk, top_p=current_topp,
+                    frequency_penalty=current_freq_pen,
+                    repetition_penalty=current_rep_pen,
+                    min_new_tokens=current_min_tokens,
+                    stream=True,
                 ):
                     print(chunk, end="", flush=True)
                     response += chunk
                 print(f"\n  [{time.time() - t0:.1f}s]")
             else:
                 response = generator.generate(
-                    user_input, max_new_tokens, current_temp,
-                    frequency_penalty=current_freq_penalty,
+                    user_input, current_max, current_temp,
+                    top_k=current_topk, top_p=current_topp,
+                    frequency_penalty=current_freq_pen,
+                    repetition_penalty=current_rep_pen,
+                    min_new_tokens=current_min_tokens,
                 )
                 elapsed = time.time() - t0
                 print(f"TGAI: {response}\n  [{elapsed:.1f}s]")
@@ -475,6 +662,10 @@ def single_generate(
     prompt: str,
     temperature: float = 0.8,
     max_new_tokens: int = 256,
+    top_k: int = 50,
+    top_p: float = 0.95,
+    frequency_penalty: float = 0.25,
+    repetition_penalty: float = 1.05,
     stream: bool = False,
 ):
     """单次文本生成"""
@@ -485,11 +676,22 @@ def single_generate(
 
     if stream:
         print("生成: ", end="", flush=True)
-        for chunk in generator.generate(prompt, max_new_tokens, temperature, stream=True):
+        for chunk in generator.generate(
+            prompt, max_new_tokens, temperature,
+            top_k=top_k, top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
+            stream=True,
+        ):
             print(chunk, end="", flush=True)
         print()
     else:
-        response = generator.generate(prompt, max_new_tokens, temperature)
+        response = generator.generate(
+            prompt, max_new_tokens, temperature,
+            top_k=top_k, top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
+        )
         print(f"生成:\n{response}")
 
 
@@ -505,7 +707,14 @@ if __name__ == '__main__':
     parser.add_argument('--prompt', type=str, default='你好，请问苹果是什么')
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--max_tokens', type=int, default=128)
+    parser.add_argument('--top_k', type=int, default=50, help='Top-K 采样')
+    parser.add_argument('--top_p', type=float, default=0.95, help='Top-P 核采样')
+    parser.add_argument('--freq_penalty', type=float, default=0.25, help='频率惩罚')
+    parser.add_argument('--rep_penalty', type=float, default=1.05, help='重复惩罚')
+    parser.add_argument('--min_tokens', type=int, default=5, help='最小生成长度(EOS禁用token数)')
     parser.add_argument('--stream', action='store_true', help='流式输出')
+    parser.add_argument('--extend', type=int, default=0,
+                        help='启用 Self-Extend 长上下文扩展，参数为扩展目标长度 (如 4096, 8192, 65536)')
     parser.add_argument('--no_cuda', action='store_true')
     args = parser.parse_args()
 
@@ -529,13 +738,21 @@ if __name__ == '__main__':
                 break
 
     try:
-        model, tokenizer = load_model(ckpt_path, args.tokenizer, device)
+        self_extend = args.extend > 0
+        extend_len = args.extend if self_extend else 4096
+        model, tokenizer = load_model(ckpt_path, args.tokenizer, device,
+                                      self_extend=self_extend,
+                                      extend_max_seq_len=extend_len)
     except FileNotFoundError as e:
         print(f"错误: {e}")
         print("\n请先运行 train.py 训练模型。")
         sys.exit(1)
 
     if args.mode == 'interactive':
-        interactive_chat(model, tokenizer, args.temperature, args.max_tokens, args.stream)
+        interactive_chat(model, tokenizer, args.temperature, args.max_tokens,
+                         args.top_k, args.top_p, args.freq_penalty, args.rep_penalty,
+                         args.min_tokens, args.stream)
     else:
-        single_generate(model, tokenizer, args.prompt, args.temperature, args.max_tokens, args.stream)
+        single_generate(model, tokenizer, args.prompt, args.temperature, args.max_tokens,
+                        args.top_k, args.top_p, args.freq_penalty, args.rep_penalty,
+                        args.stream)

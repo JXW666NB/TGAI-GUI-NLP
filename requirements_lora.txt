@@ -1,0 +1,3 @@
+# TGAI LoRA 微调依赖 (AutoDL 用)
+torch>=2.0.0
+tokenizers>=0.15.0

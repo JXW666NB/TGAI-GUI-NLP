@@ -570,12 +570,41 @@ def train(config: TrainConfig):
     print(f"  参数: {n_params:,} (~{n_params/1e6:.1f}M)")
 
     # ── 5. 优化器 & 调度器 ───────────────────────────
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-        betas=(0.9, 0.95),
-    )
+    # 自动选择: 显存 ≥ 60GB → AdamW (更优), < 60GB → SGD+CPU-offload (省内存)
+    big_gpu = use_gpu and gpu_mem >= 60
+    if big_gpu:
+        print(f"  优化器: AdamW (显存充足, {gpu_mem:.0f}GB)")
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay,
+            betas=(0.9, 0.95),
+        )
+    else:
+        print(f"  优化器: SGD+CPU-offload (显存紧张, {gpu_mem:.0f}GB)")
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=config.learning_rate,
+            momentum=0.9,
+            weight_decay=config.weight_decay,
+            nesterov=True,
+            foreach=False,
+        )
+        _opt_step = optimizer.step
+        def _cpu_offload_step(closure=None):
+            for state in optimizer.state.values():
+                if 'momentum_buffer' in state:
+                    buf = state['momentum_buffer']
+                    if buf.device.type == 'cpu':
+                        state['momentum_buffer'] = buf.to(device, non_blocking=True)
+            ret = _opt_step(closure)
+            for state in optimizer.state.values():
+                if 'momentum_buffer' in state:
+                    buf = state['momentum_buffer']
+                    state['momentum_buffer'] = buf.detach().cpu()
+            torch.cuda.empty_cache()
+            return ret
+        optimizer.step = _cpu_offload_step
     total_steps = (len(train_loader) // config.grad_accum_steps) * config.epochs
     scheduler = CosineWarmupScheduler(
         optimizer,
@@ -606,14 +635,35 @@ def train(config: TrainConfig):
     if resume_path:
         try:
             ckpt = load_checkpoint(resume_path, str(device))
-            model.load_state_dict(ckpt['model_state_dict'])
-            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-            if 'scheduler_state_dict' in ckpt:
-                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-            start_epoch = ckpt['epoch']
-            global_step = ckpt['global_step']
-            best_ppl = ckpt.get('best_ppl', float('inf'))
-            print(f"  → 从 epoch {start_epoch}, step {global_step} 继续")
+            state_dict = ckpt['model_state_dict']
+
+            # 删除 RoPE cos/sin: checkpoint 的 max_seq_len 可能与当前训练不同
+            # (如嫁接时 8192, 训练时 512)。RoPE 是确定性 buffer，模型初始化时已正确计算。
+            rope_keys = [k for k in state_dict if '.rope.cos' in k or '.rope.sin' in k]
+            for k in rope_keys:
+                del state_dict[k]
+            if rope_keys:
+                print(f"  已跳过 {len(rope_keys)} 个 RoPE 参数 (尺寸不匹配, 使用当前模型)")
+
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            # 过滤 RoPE 缺失 (已故意删除，用当前模型尺寸)
+            missing = [k for k in missing if '.rope.cos' not in k and '.rope.sin' not in k]
+            if missing:
+                print(f"  缺失 key ({len(missing)}): {missing[:3]}...")
+            if unexpected:
+                print(f"  多余 key ({len(unexpected)}): {unexpected[:3]}...")
+
+            # 续训 checkpoint 才有 optimizer/scheduler；嫁接初始权重没有
+            if 'optimizer_state_dict' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                if 'scheduler_state_dict' in ckpt:
+                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                start_epoch = ckpt['epoch']
+                global_step = ckpt['global_step']
+                best_ppl = ckpt.get('best_ppl', float('inf'))
+                print(f"  → 从 epoch {start_epoch}, step {global_step} 继续")
+            else:
+                print(f"  → 加载初始权重成功 (从头训练)")
         except Exception as e:
             print(f"  [警告] 续训失败: {e}，从头开始")
 
@@ -647,15 +697,22 @@ def train(config: TrainConfig):
 
         import tqdm as _tqdm
         n_opt_steps = len(train_loader) // config.grad_accum_steps
+        resume_step = global_step  # 续训起始步
+        skip_batches = global_step * config.grad_accum_steps if epoch == start_epoch else 0
+        if skip_batches > 0:
+            print(f"  跳过 {skip_batches} 个已完成的 batch (从 step {global_step} 继续)...")
         pbar = _tqdm.tqdm(range(len(train_loader)), desc=f"Epoch {epoch}", leave=True)
         for batch_idx, (inputs, targets) in enumerate(train_loader):
+            if batch_idx < skip_batches:
+                pbar.update(1)
+                continue
             inputs = inputs.to(device, non_blocking=use_gpu)
             targets = targets.to(device, non_blocking=use_gpu)
 
-            # ── 前向传播 (AMP) ──
+            # ── 前向传播 (AMP + 梯度检查点) ──
             if scaler is not None:
                 with torch.amp.autocast('cuda'):
-                    logits, _ = model(inputs)
+                    logits, _ = model(inputs, use_checkpoint=True)
                     ce_loss = F.cross_entropy(
                         logits.view(-1, logits.size(-1)),
                         targets.view(-1),
@@ -665,7 +722,7 @@ def train(config: TrainConfig):
                     loss = (ce_loss + moe_loss) / config.grad_accum_steps
                 scaler.scale(loss).backward()
             else:
-                logits, _ = model(inputs)
+                logits, _ = model(inputs, use_checkpoint=True)
                 ce_loss = F.cross_entropy(
                     logits.view(-1, logits.size(-1)),
                     targets.view(-1),
@@ -694,9 +751,9 @@ def train(config: TrainConfig):
                 scheduler.step()
                 global_step += 1
                 epoch_loss += accum_loss
+                avg = epoch_loss / max(1, global_step - resume_step) / config.grad_accum_steps
                 accum_loss = 0.0
                 accum_steps = 0
-                avg = epoch_loss / max(1, global_step - (epoch-1) * n_opt_steps)
                 pbar.set_postfix(step=global_step, loss=f"{avg:.4f}")
                 pbar.update(config.grad_accum_steps)
 
@@ -706,7 +763,7 @@ def train(config: TrainConfig):
                         os.path.join(config.checkpoint_dir, 'last_step.pt'),
                         model, optimizer, scheduler, tokenizer, config,
                         epoch, global_step,
-                        epoch_loss / max(1, global_step - (epoch - start_epoch) * len(train_loader) // config.grad_accum_steps),
+                        epoch_loss / max(1, global_step - resume_step),
                         best_ppl,
                     )
                     msg = f"  → 步级保存: step{global_step} (last_step.pt)"
@@ -723,12 +780,21 @@ def train(config: TrainConfig):
                 if global_step % config.eval_every_steps == 0:
                     val_ppl = evaluate(model, val_loader, max_batches=10)
                     lr = scheduler.get_lr()
-                    moe_str = f"MoE: {moe_loss.item():.4f} | " if use_moe else ""
+                    moe_str = f"MoE: {moe_loss.item():.6f} | " if use_moe else ""
                     print(
                         f"  Step {global_step:6d} | CE: {ce_loss.item():.4f} | "
                         f"{moe_str}"
                         f"PPL: {val_ppl:.2f} | LR: {lr:.2e}"
                     )
+                    # 专家使用率诊断 (选前/中/后 3 层)
+                    if use_moe:
+                        n_layers = len(model.blocks)
+                        sample_layers = [0, n_layers // 2, n_layers - 1]
+                        for li in sample_layers:
+                            usage = model.blocks[li].moe.expert_usage
+                            if usage is not None:
+                                usage_list = [f"{u*100:.1f}%" for u in usage.tolist()]
+                                print(f"  L{li:02d} 专家分配: {' | '.join(usage_list)}")
 
         # ── Epoch 结束 ──
         pbar.close()
@@ -813,6 +879,8 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--warmup', type=int, default=500)
     parser.add_argument('--resume', type=str, default='', help='续训checkpoint路径 (留空自动找 last_step.pt)')
+    parser.add_argument('--checkpoint_dir', type=str, default='', help='checkpoint保存目录 (默认checkpoints/)')
+    parser.add_argument('--cache_dir', type=str, default='', help='数据集缓存目录 (默认checkpoints/cache)')
     parser.add_argument('--no_cuda', action='store_true')
     parser.add_argument('--compile', action='store_true', help='启用 torch.compile 加速 (4090 可提速 20-40%%)')
     parser.add_argument('--save_every', type=int, default=0, help='步级保存间隔 (覆盖默认值，建议 50-500)')
@@ -838,6 +906,10 @@ if __name__ == '__main__':
     )
     if args.resume:
         config._resume_path = args.resume
+    if args.checkpoint_dir:
+        config.checkpoint_dir = args.checkpoint_dir
+    if args.cache_dir:
+        config.cache_dir = args.cache_dir
     if args.save_every > 0:
         config.save_every_steps = args.save_every
     if args.compile:

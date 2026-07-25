@@ -462,6 +462,11 @@ tgai_nlp/
 ├── requirements.txt        # 基础依赖
 ├── requirements_cpu.txt    # CPU 训练依赖
 ├── requirements_gpu.txt    # GPU 训练依赖（CUDA 12.4）
+├── scripts/
+│   ├── export_onnx.py      # 🔧 PyTorch → ONNX 导出
+│   ├── pack_tg.py          # 📦 ONNX → .TG 打包
+│   ├── export_tokenizer_mobile.py  # 手机端 tokenizer 导出
+│   └── export_for_mobile.py        # 完整移动端导出
 ├── .gitignore
 ├── LICENSE
 └── README.md               # 你他妈正在看的这玩意儿

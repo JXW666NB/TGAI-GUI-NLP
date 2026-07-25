@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 # 特殊token ID（与 tokenizer.py 保持一致）
 PAD_ID = 0
@@ -49,6 +50,10 @@ class TGAIConfig:
     # RoPE
     rope_theta: float = 10000.0
 
+    # 上下文扩展 (Self-Extend: 零训练零微调动态位置分组)
+    self_extend: bool = False          # 启用长上下文扩展
+    extend_max_seq_len: int = 4096     # 扩展后的最大 KV 缓存长度
+
     @property
     def d_k(self) -> int:
         return self.d_model // self.n_heads
@@ -58,17 +63,22 @@ class TGAIConfig:
 # RoPE
 # ═══════════════════════════════════════════════════════════
 class RotaryPositionEmbedding(nn.Module):
-    """RoPE 旋转位置编码。使用标准 rotate_half 实现，避免 float32 升降精度。"""
+    """RoPE 旋转位置编码。支持 Dynamic Self-Extend 长上下文扩展（零训练）。"""
 
-    def __init__(self, dim: int, max_seq_len: int, theta: float = 10000.0):
+    def __init__(self, dim: int, max_seq_len: int, theta: float = 10000.0,
+                 self_extend: bool = False, extend_w0: int = 64):
         super().__init__()
+        self.dim = dim
+        self.pretrained_len = max_seq_len
+        self.theta = theta
+        self.self_extend = self_extend
+        self.extend_w0 = extend_w0  # 局部窗口 (YaRN 暂不用, 留给后续 bifocal)
+
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         positions = torch.arange(max_seq_len).float()
         angles = torch.outer(positions, freqs)  # (max_seq_len, dim//2)
-        # 每个频率值重复2次以匹配交错配对
         cos_dup = angles.cos().repeat_interleave(2, dim=-1)  # (max_seq_len, dim)
         sin_dup = angles.sin().repeat_interleave(2, dim=-1)
-        # 预广播: (1, 1, max_seq_len, dim)
         self.register_buffer('cos', cos_dup.unsqueeze(0).unsqueeze(0))
         self.register_buffer('sin', sin_dup.unsqueeze(0).unsqueeze(0))
 
@@ -80,17 +90,88 @@ class RotaryPositionEmbedding(nn.Module):
         result[..., 1::2] = x[..., ::2]
         return result
 
+    def _compute_cos_sin(self, positions: torch.Tensor, device, dtype,
+                          theta: float = None) -> tuple:
+        """根据给定位置动态计算 cos/sin。theta=None 使用默认值。"""
+        th = theta if theta is not None else self.theta
+        freqs = 1.0 / (th ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+        angles = torch.outer(positions.float(), freqs)  # (N, dim//2)
+        emb = angles.repeat_interleave(2, dim=-1)  # (N, dim)
+        cos = emb.cos().unsqueeze(0).unsqueeze(0).to(dtype)  # (1, 1, N, dim)
+        sin = emb.sin().unsqueeze(0).unsqueeze(0).to(dtype)
+        return cos, sin
+
     def forward(self, x: torch.Tensor, position_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
         seq_len = x.shape[-2]
+        device = x.device
+        dtype = x.dtype
+
+        # ── YaRN NTK-by-parts: 高频插值, 低频外推, 中频平滑 ──
+        if self.self_extend and seq_len > self.pretrained_len:
+            scale = seq_len / self.pretrained_len
+
+            # 原始频率向量
+            inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.dim, 2, device=device).float() / self.dim))
+            # 波长: 每个频率对应的完整旋转周期长度
+            wavelen = 2 * math.pi / inv_freq
+
+            # 频率分类: L/wavelen 越大=高频 (短波), 越小=低频 (长波)
+            freq_ratio = self.pretrained_len / wavelen
+            # ramp=0: 高频 → NTK 插值 (除以 scale); ramp=1: 低频 → 直接外推
+            ramp = torch.clamp((freq_ratio - 1) / (32 - 1), 0.0, 1.0)  # β_fast=32, β_slow=1
+
+            # 逐维度频率缩放
+            new_inv_freq = ramp * inv_freq + (1 - ramp) * (inv_freq / scale)
+
+            # 注意力温度修正 (防 softmax 扩散)
+            mscale = 0.1 * math.log(scale) + 1.0
+            self._yarn_temp = mscale
+            self._yarn_inv_freq = new_inv_freq.detach().clone()
+
+            if position_ids is not None:
+                pos = position_ids.float().flatten()
+            else:
+                pos = torch.arange(seq_len, device=device).float()
+
+            angles = torch.outer(pos, new_inv_freq)  # (N, dim//2)
+            emb = angles.repeat_interleave(2, dim=-1)
+            cos = (emb.cos() * mscale).unsqueeze(0).unsqueeze(0).to(dtype)
+            sin = (emb.sin() * mscale).unsqueeze(0).unsqueeze(0).to(dtype)
+            if position_ids is not None:
+                cos = cos[:, :, :seq_len, :]
+                sin = sin[:, :, :seq_len, :]
+            return (x * cos) + (self._rotate_half(x) * sin)
+
+        # ── 原始路径: 训练窗口内 / decode 阶段 ──
         if position_ids is not None:
-            # 使用指定位置（推理时传入 cache_pos）
-            positions = position_ids  # (1, seq_len)
-            cos = self.cos[:, :, positions, :].squeeze(2)  # (1, 1, seq, dim)
-            sin = self.sin[:, :, positions, :].squeeze(2)
+            positions = position_ids
+            max_p = positions.max().item()
+            if self.self_extend and getattr(self, '_yarn_inv_freq', None) is not None and max_p >= self.pretrained_len:
+                # decode: 复用 prefill 的 YaRN 频率, 保持 query-key 一致
+                pos = positions.float().flatten()
+                angles = torch.outer(pos, self._yarn_inv_freq.to(device))
+                emb = angles.repeat_interleave(2, dim=-1)
+                mscale = getattr(self, '_yarn_temp', 1.0)
+                cos = (emb.cos() * mscale).unsqueeze(0).unsqueeze(0).to(dtype)
+                sin = (emb.sin() * mscale).unsqueeze(0).unsqueeze(0).to(dtype)
+                cos = cos[:, :, :seq_len, :]
+                sin = sin[:, :, :seq_len, :]
+            elif max_p >= self.cos.shape[2]:
+                # 位置超出 buffer，动态计算 cos/sin
+                pos = positions.float().flatten()
+                cos, sin = self._compute_cos_sin(pos, device, dtype)
+                cos = cos[:, :, :seq_len, :]
+                sin = sin[:, :, :seq_len, :]
+            else:
+                cos = self.cos[:, :, positions, :].squeeze(2)  # (1, 1, seq, dim)
+                sin = self.sin[:, :, positions, :].squeeze(2)
         else:
             # 训练/prefill：按顺序 0,1,2,...
             cos = self.cos[:, :, :seq_len, :]
             sin = self.sin[:, :, :seq_len, :]
+        # 确保 cos/sin 与输入 dtype 一致（buffer 默认 FP32，FP16 模型需转换）
+        cos = cos.to(dtype)
+        sin = sin.to(dtype)
         return (x * cos) + (self._rotate_half(x) * sin)
 
 
@@ -147,6 +228,7 @@ class MoELayer(nn.Module):
         self.gate = nn.Linear(config.d_model, config.n_experts, bias=False)  # 门控缩放
 
         self._load_balance_loss = 0.0
+        self._expert_usage = None  # 每个专家的平均使用率 (n_experts,)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -163,11 +245,14 @@ class MoELayer(nn.Module):
         topk_vals, topk_ids = torch.topk(router_logits, self.n_activated, dim=-1)
         router_probs = F.softmax(topk_vals, dim=-1)  # (B*T, K)
 
-        # 负载均衡 loss
+        # 专家使用率 (推理时也记录，用于诊断)
+        gate_logits = self.gate(x_flat)
+        expert_probs = F.softmax(gate_logits, dim=-1)
+        expert_usage = expert_probs.mean(dim=0)
+        self._expert_usage = expert_usage.detach()
+
+        # 负载均衡 loss (仅训练)
         if self.training:
-            gate_logits = self.gate(x_flat)
-            expert_probs = F.softmax(gate_logits, dim=-1)
-            expert_usage = expert_probs.mean(dim=0)
             target_usage = torch.ones_like(expert_usage) / self.n_experts
             self._load_balance_loss = F.mse_loss(expert_usage, target_usage)
 
@@ -202,10 +287,22 @@ class MoELayer(nn.Module):
     def load_balance_loss(self) -> float:
         return self._load_balance_loss
 
+    @property
+    def expert_usage(self):
+        """每个专家的平均使用率, shape=(n_experts,), 或 None"""
+        return self._expert_usage
+
 
 # ═══════════════════════════════════════════════════════════
 # Flash Attention
 # ═══════════════════════════════════════════════════════════
+
+def _selfext_decode_pos(cache_pos: int, rope) -> int:
+    """Dynamic NTK 不改变位置，直接返回原始 cache_pos。
+    位置过大时由 RoPE 内 _ntk_theta 处理频率缩放。"""
+    return cache_pos  # NTK 改频率不改位置
+
+
 class FlashSelfAttention(nn.Module):
     """使用 torch.nn.functional.scaled_dot_product_attention 的因果自注意力"""
 
@@ -220,9 +317,12 @@ class FlashSelfAttention(nn.Module):
         self.v_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
 
-        self.rope = RotaryPositionEmbedding(config.d_k, config.max_seq_len, config.rope_theta)
+        self.rope = RotaryPositionEmbedding(
+            config.d_k, config.max_seq_len, config.rope_theta,
+            self_extend=config.self_extend,
+        )
         self.dropout_p = config.dropout
-        self._max_seq_len = config.max_seq_len
+        self._max_seq_len = config.extend_max_seq_len if config.self_extend else config.max_seq_len
 
     def forward(
         self,
@@ -236,10 +336,10 @@ class FlashSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_heads, self.d_k).transpose(1, 2)
 
-        # RoPE — 解码时传入真实位置
+        # RoPE — 解码时传入真实位置 (Self-Extend 兼容)
         if kv_cache is not None and kv_cache.get('k') is not None and T == 1:
-            # 解码阶段：单 token，使用真实位置
-            pos_ids = torch.tensor([[cache_pos]], device=x.device)
+            pos = _selfext_decode_pos(cache_pos, self.rope)
+            pos_ids = torch.tensor([[pos]], device=x.device)
             q = self.rope(q, position_ids=pos_ids)
             k = self.rope(k, position_ids=pos_ids)
         else:
@@ -441,12 +541,14 @@ class TGAILanguageModel(nn.Module):
         image: Optional[torch.Tensor] = None,
         audio: Optional[torch.Tensor] = None,
         video: Optional[torch.Tensor] = None,
+        use_checkpoint: bool = False,
     ) -> Tuple[torch.Tensor, Optional[List[Optional[Dict[str, torch.Tensor]]]]]:
         """
         Args:
             input_ids: (B, T)
             kv_caches: KV Cache 列表
             image/audio/video: 多模态输入 (预留)
+            use_checkpoint: 训练时启用梯度检查点 (用计算换显存)
         Returns:
             logits: (B, T, vocab_size)
             new_kv_caches: 更新的 KV Cache
@@ -460,7 +562,13 @@ class TGAILanguageModel(nn.Module):
 
         for i, block in enumerate(self.blocks):
             cache = kv_caches[i] if kv_caches is not None else None
-            x, new_cache = block(x, cache, cache_pos)
+            if use_checkpoint and self.training:
+                # 梯度检查点：不存 block 内激活，反向时重算
+                x, new_cache = torch_checkpoint(
+                    block, x, cache, cache_pos, use_reentrant=False,
+                )
+            else:
+                x, new_cache = block(x, cache, cache_pos)
             if new_caches is not None:
                 new_caches.append(new_cache)
             if self.training:
@@ -470,6 +578,14 @@ class TGAILanguageModel(nn.Module):
         logits = self.lm_head(x)
 
         return logits, new_caches
+
+    def set_self_extend(self, enable: bool, extend_len: int = 8192):
+        """传播 self_extend 到所有 RoPE 层（修改 config 不自动传播）"""
+        self.config.self_extend = enable
+        self.config.extend_max_seq_len = extend_len
+        for block in self.blocks:
+            block.attn.rope.self_extend = enable
+            block.attn.rope._yarn_inv_freq = None  # 重置，下次 prefill 重新计算
 
     # ─── 推理 (KV Cache 加速) ─────────────────────────
     @torch.inference_mode()
@@ -484,6 +600,7 @@ class TGAILanguageModel(nn.Module):
         min_new_tokens: int = 5,
         repetition_penalty: float = 1.05,
         frequency_penalty: float = 0.15,
+        token_bias: dict = None,
     ) -> torch.Tensor:
         """
         自回归生成，使用 KV Cache 加速。
@@ -506,10 +623,11 @@ class TGAILanguageModel(nn.Module):
         generated = prompt_ids.clone()
         new_tokens = 0
         token_counts = torch.zeros(vocab_size, dtype=torch.long, device=device)
+        effective_max = self.config.extend_max_seq_len if self.config.self_extend else self.config.max_seq_len
 
         for _ in range(max_new_tokens):
-            if generated.shape[1] > self.config.max_seq_len:
-                generated = generated[:, -self.config.max_seq_len // 2:]
+            if generated.shape[1] >= effective_max:
+                generated = generated[:, -effective_max // 2:]
                 kv_caches = [{} for _ in range(self.config.n_layers)]
                 token_counts.zero_()
                 for t in generated[0].tolist():
@@ -561,6 +679,11 @@ class TGAILanguageModel(nn.Module):
                 if eos_token_id < vocab_size:
                     next_logits[0, eos_token_id] = 0.0
 
+            # token bias: 惩罚特定 token 但不禁用
+            if token_bias:
+                for tid, bias in token_bias.items():
+                    next_logits[0, tid] += bias
+
             probs = F.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).clamp(0, vocab_size - 1)
 
@@ -596,6 +719,8 @@ def create_model(
     dropout: float = 0.1,
     n_experts: int = 4,
     n_activated: int = 2,
+    self_extend: bool = False,
+    extend_max_seq_len: int = 4096,
 ) -> TGAILanguageModel:
     config = TGAIConfig(
         vocab_size=vocab_size,
@@ -607,5 +732,7 @@ def create_model(
         dropout=dropout,
         n_experts=n_experts,
         n_activated=n_activated,
+        self_extend=self_extend,
+        extend_max_seq_len=extend_max_seq_len,
     )
     return TGAILanguageModel(config)

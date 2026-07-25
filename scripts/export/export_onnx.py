@@ -23,7 +23,7 @@ import torch.nn.functional as F
 
 torch.set_num_threads(1)
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tgai_nlp'))
 from model import TGAILanguageModel, MoELayer, create_model
 from tokenizer import ChineseTokenizer
 

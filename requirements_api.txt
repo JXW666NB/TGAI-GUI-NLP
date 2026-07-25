@@ -1,0 +1,6 @@
+# TGAI API 服务器 — 精简部署依赖
+# AutoDL 安装命令: pip install -r requirements_api.txt
+
+torch>=2.0.0
+tokenizers>=0.15.0
+flask>=2.3.0

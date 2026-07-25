@@ -37,6 +37,11 @@ class BotConfig:
     whitelist: list = []      # 白名单 QQ 号（空=不限制）
     max_reply_tokens: int = 256
     temperature: float = 0.8
+    top_k: int = 80
+    top_p: float = 0.9
+    repetition_penalty: float = 1.05
+    frequency_penalty: float = 0.15
+    min_new_tokens: int = 3
     max_context: int = 10     # 上下文保留轮数
 
 
@@ -46,8 +51,9 @@ class BotConfig:
 class TGAIEngine:
     """加载 TGAI 模型，提供 generate() 接口"""
 
-    def __init__(self, checkpoint_path: str, tokenizer_path: str, device: str = "cpu"):
+    def __init__(self, checkpoint_path: str, tokenizer_path: str, device: str = "cpu", config: BotConfig = None):
         print(f"[TGAI] 加载模型: {checkpoint_path}")
+        self.config = config or BotConfig()
         self.tokenizer = ChineseTokenizer.load(tokenizer_path)
         print(f"[TGAI] 词表: {self.tokenizer.vocab_size_actual}")
 
@@ -76,35 +82,18 @@ class TGAIEngine:
 
     def generate(self, prompt: str, max_tokens: int = 128, temperature: float = 0.8) -> str:
         """根据 prompt 生成回复"""
-        formatted = f"用户:{prompt}\nTGAI?"
-        prompt_ids = [BOS_ID] + self.tokenizer.encode(formatted, add_special=False)
-        prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
-
-        output_ids = self.model.generate(
-            prompt_tensor,
+        from inference import TextGenerator
+        generator = TextGenerator(self.model, self.tokenizer)
+        reply = generator.generate(
+            prompt,
             max_new_tokens=max_tokens,
             temperature=temperature,
-            top_k=80,
-            top_p=0.9,
-            eos_token_id=EOS_ID,
-            min_new_tokens=3,
-            repetition_penalty=1.05,
-            frequency_penalty=0.15,
+            top_k=self.config.top_k,
+            top_p=self.config.top_p,
+            min_new_tokens=self.config.min_new_tokens,
+            repetition_penalty=self.config.repetition_penalty,
+            frequency_penalty=self.config.frequency_penalty,
         )
-
-        full_text = self.tokenizer.decode(output_ids[0].tolist(), skip_special=True)
-        prompt_text = self.tokenizer.decode(prompt_ids, skip_special=True)
-
-        if full_text.startswith(prompt_text):
-            reply = full_text[len(prompt_text):]
-        else:
-            reply = full_text
-
-        # 截断多余的对话轮次
-        for sep in ['\n用户:', '用户:', 'TGAI?']:
-            idx = reply.find(sep)
-            if idx > 0:
-                reply = reply[:idx]
         return reply.strip() or "[空回复]"
 
 
@@ -255,12 +244,15 @@ if __name__ == '__main__':
     parser.add_argument('--bot-qq', type=int, default=0, help='机器人 QQ 号')
     parser.add_argument('--whitelist', type=str, default='', help='白名单(逗号分隔)')
     parser.add_argument('--temp', type=float, default=0.8, help='温度')
+    parser.add_argument('--max-tokens', type=int, default=256, help='最大回复 token 数')
+    parser.add_argument('--top-k', type=int, default=80, help='Top-K 采样')
+    parser.add_argument('--top-p', type=float, default=0.9, help='Top-P 核采样')
+    parser.add_argument('--rep-penalty', type=float, default=1.05, help='重复惩罚 (1.0=关闭)')
+    parser.add_argument('--freq-penalty', type=float, default=0.15, help='频率惩罚')
+    parser.add_argument('--min-tokens', type=int, default=3, help='最小生成token数(EOS禁用)')
     args = parser.parse_args()
 
     device = "cuda" if args.cuda and torch.cuda.is_available() else "cpu"
-
-    # 加载模型
-    engine = TGAIEngine(args.checkpoint, args.tokenizer, device)
 
     # 配置
     config = BotConfig()
@@ -268,8 +260,17 @@ if __name__ == '__main__':
     config.napcat_http_url = f"http://127.0.0.1:{args.port}"
     config.bot_qq = args.bot_qq
     config.temperature = args.temp
+    config.max_reply_tokens = args.max_tokens
+    config.top_k = args.top_k
+    config.top_p = args.top_p
+    config.repetition_penalty = args.rep_penalty
+    config.frequency_penalty = args.freq_penalty
+    config.min_new_tokens = args.min_tokens
     if args.whitelist:
         config.whitelist = [int(x.strip()) for x in args.whitelist.split(',')]
+
+    # 加载模型
+    engine = TGAIEngine(args.checkpoint, args.tokenizer, device, config)
 
     # 启动
     bot = TGAIQQBot(engine, config)
