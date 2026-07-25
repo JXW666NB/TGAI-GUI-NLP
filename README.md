@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.2.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.3.0-blue" alt="version">
   <img src="https://img.shields.io/badge/python-3.9+-green" alt="python">
   <img src="https://img.shields.io/badge/pytorch-2.0+-red" alt="pytorch">
   <img src="https://img.shields.io/badge/license-MIT-orange" alt="license">
@@ -39,6 +39,9 @@
 - 📱 **手机端部署** — 训完导出 ONNX 模型，扔到 TG CHAT APP 里就能离线推理。支持 INT8 量化加速。
 - 🌐 **WebUI 远程操控** — Flask + Socket.IO，手机/平板打开浏览器就能训练和聊天。
 - 🤖 **QQ 机器人** — 接 NapCat，自动回复群聊和私聊，还可以语音。
+- 🌐 **REST API 服务** — 内建 API 服务器，支持 `/api/chat`、`/api/generate`，可接入任何前端。
+- 🔧 **LoRA 微调** — 低秩适配器训练，极低显存下微调已有模型。
+- 🎛️ **词频偏置** — 热加载 `word_bias_config.json`，控制特定词的生成概率。
 - 📊 **数据工具链** — 训练数据统计分析、清洗去重、JSONL 合并，反正就是伺候你那个屎山数据集。
 - ⚡ **AMP 混合精度** — 自动混合精度训练，显卡不冒烟的同时快一截。
 - 💾 **智能缓存** — 数据集 mmap 缓存，几 GB 的 JSONL 也不用把内存撑爆。
@@ -375,13 +378,13 @@ python tgai_qq_bot.py --checkpoint checkpoints/milestone4000.pt
 
 ```bash
 # 步骤 1: 导出 ONNX 模型
-python scripts/export_onnx.py \
+python scripts/export/export_onnx.py \
     --checkpoint checkpoints/milestone4000.pt \
     --out_dir exported/ \
     --int8
 
 # 步骤 2: 打包为 .TG
-python scripts/pack_tg.py \
+python scripts/export/pack_tg.py \
     --model exported/tgai.onnx \
     --tokenizer exported/tokenizer.json \
     --out TGAI-4000.tg
@@ -403,10 +406,12 @@ python scripts/pack_tg.py \
 
 | 脚本 | 作用 |
 |------|------|
-| `scripts/export_onnx.py` | PyTorch checkpoint → ONNX 模型 |
-| `scripts/pack_tg.py` | ONNX + tokenizer → .TG 打包文件 |
-| `scripts/export_tokenizer_mobile.py` | 单独导出手机端 tokenizer |
-| `scripts/export_for_mobile.py` | 完整移动端导出（含自定义量化格式） |
+| `scripts/export/export_onnx.py` | PyTorch checkpoint → ONNX 模型 |
+| `scripts/export/pack_tg.py` | ONNX + tokenizer → .TG 打包文件 |
+| `scripts/export/export_tokenizer_mobile.py` | 单独导出手机端 tokenizer |
+| `scripts/export/export_for_mobile.py` | 完整移动端导出（含自定义量化格式） |
+| `scripts/export/export_executorch.py` | ExecuTorch 格式导出（Android/iOS） |
+| `scripts/export/export_pytorch_mobile.py` | PyTorch Mobile 格式导出 |
 
 > ⚠️ 导出需要 8GB+ 内存。如果你的 checkpoint 包含优化器状态（训练存档），内存需求更大。建议用只含模型权重的 checkpoint 来导出。如果内存不够，找台内存大的电脑跑。
 
@@ -452,21 +457,27 @@ tgai_nlp/
 ├── webui.py                # 🌐 Flask + Socket.IO WebUI（手机也能用）
 ├── tgai_cli.py             # ☁️ 命令行工具（云端训练/数据管理/配置生成）
 ├── train.py                # 🔥 训练引擎（AMP 混合精度、梯度累积、断点续训）
+├── train_lora.py           # 🔧 LoRA 低秩适配器微调
 ├── model.py                # 🧠 V4 MoE Transformer 模型定义
 ├── tokenizer.py            # 🔤 BPE 分词器（中文优化 CJK 预分词）
 ├── inference.py            # 💬 推理引擎（流式输出/KV Cache/采样策略）
 ├── tgai_qq_bot.py          # 🤖 QQ 机器人（NapCat 协议）
+├── word_bias_config.json   # 🎛️ 词频偏置配置（热加载）
 ├── data/
-│   ├── custom_train.jsonl  # 示例训练数据（30+ 条 QA）
+│   ├── custom_train.jsonl  # 示例训练数据
 │   └── train_all.jsonl     # 完整训练数据
 ├── requirements.txt        # 基础依赖
 ├── requirements_cpu.txt    # CPU 训练依赖
 ├── requirements_gpu.txt    # GPU 训练依赖（CUDA 12.4）
+├── requirements_api.txt    # API 服务器依赖
+├── requirements_lora.txt   # LoRA 训练依赖
 ├── scripts/
-│   ├── export_onnx.py      # 🔧 PyTorch → ONNX 导出
-│   ├── pack_tg.py          # 📦 ONNX → .TG 打包
-│   ├── export_tokenizer_mobile.py  # 手机端 tokenizer 导出
-│   └── export_for_mobile.py        # 完整移动端导出
+│   ├── api_server.py       # 🌐 REST API 服务器
+│   ├── chat_cli.py         # 💬 命令行聊天
+│   ├── benchmarks/         # 📊 基准测试
+│   ├── deploy/             # 🚀 部署脚本（AutoDL, Cloudflare Tunnel）
+│   ├── export/             # 📦 模型导出（ONNX, ExecuTorch, .TG）
+│   └── tools/              # 🔧 辅助工具（GUI 打包器）
 ├── .gitignore
 ├── LICENSE
 └── README.md               # 你他妈正在看的这玩意儿
