@@ -1,7 +1,7 @@
 # TGAI-GUI-NLP —— 从训练到部署，一条龙全包
 
 <p align="center">
-  <strong>PyTorch 原生大语言模型训练框架 — 桌面 GUI · 云端 CLI · WebUI · QQ 机器人 · 一键导出手机端</strong>
+  <strong>PyTorch 原生大语言模型训练框架 — 桌面 GUI · 云端 CLI · WebUI · QQ 机器人 · TGAI GO 引擎 · 一键导出</strong>
 </p>
 
 <p align="center">
@@ -24,6 +24,7 @@
 - 在桌面 GUI 里聊（PyQt6）
 - 在手机浏览器上聊（Flask WebUI）
 - 挂到 QQ 上当赛博陪聊（NapCat 协议）
+- 转换为 .TG 格式，在 ESP32 单片机上跑（TGAI GO 引擎）
 - 导出 ONNX 塞进手机 APP 离线跑（TG CHAT）
 
 一句话：**数据进去，模型出来，部署一条龙。**
@@ -46,6 +47,9 @@
 - ⚡ **AMP 混合精度** — 自动混合精度训练，显卡不冒烟的同时快一截。
 - 💾 **智能缓存** — 数据集 mmap 缓存，几 GB 的 JSONL 也不用把内存撑爆。
 - 🔄 **断点续训** — 训练崩了？重开就接着跑，checkpoint 存得比你还勤快。
+- 🚀 **TGAI GO 引擎联动** — 一键将 PyTorch 模型转换为 .TG 格式，部署到 ESP32 等嵌入式设备。支持 FP32/FP16/Q8_0/Q4_0 多种量化。
+- 🔄 **GGUF 模型兼容** — 支持 Llama/Mistral/Qwen2/Phi-3 等社区模型 GGUF → .TG 转换。
+- 🏗️ **模型嫁接** — V1 模型权重可膨胀到更大 V2 架构，无需从头训练。
 
 ---
 
@@ -417,6 +421,77 @@ python scripts/export/pack_tg.py \
 
 ---
 
+## 🚀 TGAI GO 引擎 & PT→TG 转换（重点）
+
+TGAI GO 是 TGAI 的嵌入式 C 推理引擎，能在 ESP32 等单片机上跑你的模型。**TGAI-NLP 与 TGAI GO 完整联动：**
+
+### 什么是 .TG 格式？
+
+`.TG` 是 TGAI GO 的自有模型格式，包含模型权重 + tokenizer + 元数据，单文件分发。支持多种量化方式。
+
+### GUI 一键转换（推荐）
+
+打开 `gui.py`，切换到「导出」标签页，有两张卡片：
+
+**卡片 1：TGAI GO 引擎转换（PT/GGUF → .TG）**
+
+| 输入 | 说明 |
+|------|------|
+| 源文件 | `.pt`（PyTorch checkpoint）或 `.gguf`（社区模型） |
+| Tokenizer | `tokenizer.json` |
+| 输出 | `.TG` 文件 |
+| 量化 | FP32 / FP16 / Q8_0 / Q4_0 / INT8 |
+| 架构 | tgai_moe / llama / mistral / qwen2 / gemma / phi3 |
+
+点击「开始转换」即可。支持 GGUF v3 格式的 Llama/Mistral/Qwen2/Phi-3/Gemma 等社区模型。
+
+**卡片 2：传统 ONNX 导出 + 打包**
+
+| 输入 | 说明 |
+|------|------|
+| Checkpoint | `.pt` 文件 |
+| 输出 | ONNX + tokenizer → `.TG`（ZIP 格式） |
+| 量化 | 可选 INT8 |
+
+### 命令行转换
+
+```bash
+# PyTorch → .TG
+cd TGAI\ GO/tools
+python tgai_convert.py --checkpoint model.pt --output model.TG \
+    --tokenizer tokenizer.json --dtype q4_0 --arch tgai_moe
+
+# GGUF → .TG（社区模型兼容）
+python gguf_to_tg.py --input llama.gguf --output llama.TG --dtype fp16
+```
+
+### 云端转换
+
+```bash
+# 量化转换（调用 TGAI GO 工具）
+python scripts/export/cloud_quantize.py \
+    --input model.pt --output model.TG --dtype q4_0
+
+# 批量转换
+bash scripts/export/convert_cloud.sh
+
+# 模型嫁接（V1 → V2 膨胀）
+python scripts/export/graft_v2.py \
+    --input tgai_v1.pt --output tgai_v2.pt --preset lite1
+```
+
+### 部署到 ESP32
+
+转换完成后，用 TGAI GO 的上传工具烧录到 ESP32：
+
+```
+TGAI GO/tools/upload_model.bat → 选择 .TG → 上传到 ESP32 LittleFS
+```
+
+> 详细文档见 [TGAI GO 仓库](https://github.com/JXW666NB/TGAI-GO)
+
+---
+
 ## 🧠 模型架构
 
 ```
@@ -535,6 +610,7 @@ tgai_nlp/
 
 ## 🔗 相关项目
 
+- 🚀 **TGAI GO**（嵌入式 C 推理引擎）：[github.com/JXW666NB/TGAI-GO](https://github.com/JXW666NB/TGAI-GO)
 - 📱 **TG CHAT**（手机 APP）：[github.com/JXW666NB/TGAI_CHAT](https://github.com/JXW666NB/TGAI_CHAT)
 - 🛠️ **TG-HELPER**（桌面 AI 助手）：[github.com/JXW666NB/TG-HELPER](https://github.com/JXW666NB/TG-HELPER)
 - 🎮 **TGAI 模型导出**（ONNX / 手机端）：本项目的 `scripts/` 子目录
