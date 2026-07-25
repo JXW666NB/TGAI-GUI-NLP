@@ -619,3 +619,24 @@ tgai_nlp/
 
 **踏马的终于肝完力**
 —— JXW, 2025 年某个通宵的凌晨
+---
+
+## TGAI 生态（四大天王）
+
+<p align="center">
+  <strong>从训练到部署，全链路覆盖</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/JXW666NB/TGAI-GUI-NLP"><img src="https://img.shields.io/badge/%F0%9F%A7%A0_TGAI_NLP-PyTorch%E8%AE%AD%E7%BB%83-blue" alt="TGAI NLP"></a>
+  <a href="https://github.com/JXW666NB/TGAI-GO"><img src="https://img.shields.io/badge/%F0%9F%9A%80_TGAI_GO-C%2FC%2B%2B%E6%8E%A8%E7%90%86-green" alt="TGAI GO"></a>
+  <a href="https://github.com/JXW666NB/TGAI_CHAT"><img src="https://img.shields.io/badge/%F0%9F%93%B1_TGAI_CHAT-Android%20APP-red" alt="TGAI CHAT"></a>
+  <a href="https://github.com/JXW666NB/TG-HELPER"><img src="https://img.shields.io/badge/%F0%9F%9B%A0%EF%B8%8F_TG--HELPER-%E6%A1%8C%E9%9D%A2%E5%8A%A9%E6%89%8B-purple" alt="TG-HELPER"></a>
+</p>
+
+| 项目 | 说明 | 生态角色 |
+|------|------|---------|
+| **TGAI NLP** | PyTorch 训练框架 + GUI + WebUI + QQ 机器人 | **上游**：你在这里 |
+| [TGAI GO](https://github.com/JXW666NB/TGAI-GO) | C/C++ 推理引擎，跨平台运行 .TG 模型 | **中游**：模型推理 |
+| [TGAI CHAT](https://github.com/JXW666NB/TGAI_CHAT) | Android 手机 APP，离线运行 .TG 模型 | **下游**：移动端推理 |
+| [TG-HELPER](https://github.com/JXW666NB/TG-HELPER) | 桌面 AI 助手，本地化智能办公 | **下游**：桌面端应用 |
